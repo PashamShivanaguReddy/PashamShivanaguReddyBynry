@@ -5,44 +5,42 @@ from sqlalchemy.exc import IntegrityError
 @app.route("/api/products", methods=["POST"])
 def create_product():
     data = request.get_json(silent=True)
-    if not data:
+    if not isinstance(data, dict):
         return jsonify({"error": "Invalid or missing JSON body"}), 400
 
-    # Required fields for creating a product
-    required_fields = ["name", "sku", "price"]
-    missing = [f for f in required_fields if data.get(f) in (None, "")]
+    # Required product fields
+    required = ["name", "sku", "price"]
+    missing = [f for f in required if data.get(f) in (None, "")]
     if missing:
         return jsonify({"error": "Missing required fields", "fields": missing}), 400
 
     name = str(data["name"]).strip()
     sku = str(data["sku"]).strip().upper()
 
-    # Price validation using Decimal to avoid floating-point precision issues
+    # Money-safe parsing
     try:
         price = Decimal(str(data["price"]))
     except (InvalidOperation, ValueError):
         return jsonify({"error": "price must be a valid decimal"}), 400
-
     if price < 0:
         return jsonify({"error": "price must be non-negative"}), 400
 
+    # Optional fields
     warehouse_id = data.get("warehouse_id")
     initial_quantity = data.get("initial_quantity", 0)
 
-    # Quantity validation
     try:
         initial_quantity = int(initial_quantity)
     except (TypeError, ValueError):
         return jsonify({"error": "initial_quantity must be an integer"}), 400
-
     if initial_quantity < 0:
         return jsonify({"error": "initial_quantity must be non-negative"}), 400
 
-    # If a quantity is provided for initial stock, warehouse_id is required
+    # If quantity is provided, warehouse is required
     if initial_quantity > 0 and warehouse_id is None:
         return jsonify({"error": "warehouse_id is required when initial_quantity > 0"}), 400
 
-    # If warehouse_id is provided, validate it exists
+    # Validate warehouse if provided
     if warehouse_id is not None:
         warehouse = Warehouse.query.get(warehouse_id)
         if warehouse is None:
@@ -51,16 +49,16 @@ def create_product():
     try:
         # Single atomic transaction
         with db.session.begin():
-            # Product should be warehouse-agnostic for multi-warehouse support
+            # Product is global across warehouses
             product = Product(
                 name=name,
                 sku=sku,
                 price=price
             )
             db.session.add(product)
-            db.session.flush()  # ensures product.id is available
+            db.session.flush()  # product.id available before inventory insert
 
-            # Create initial inventory row only when a warehouse is provided
+            # Optional initial stock in one warehouse
             if warehouse_id is not None:
                 inventory = Inventory(
                     product_id=product.id,
@@ -76,9 +74,8 @@ def create_product():
 
     except IntegrityError as exc:
         db.session.rollback()
-        # Map SKU uniqueness to a business-level conflict response
-        msg = str(getattr(exc, "orig", exc)).lower()
-        if "sku" in msg and ("unique" in msg or "duplicate" in msg):
+        err = str(getattr(exc, "orig", exc)).lower()
+        if "sku" in err and ("unique" in err or "duplicate" in err):
             return jsonify({"error": "SKU already exists"}), 409
         return jsonify({"error": "Database integrity error"}), 400
 
